@@ -1,12 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import cos_sim
 from openai import OpenAI
 from dotenv import load_dotenv
-import numpy as np
 import os
+import json
 
 # -----------------------------
 # Load Environment Variables
@@ -18,12 +16,6 @@ client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1"
 )
-
-# -----------------------------
-# Load Embedding Model
-# -----------------------------
-
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # -----------------------------
 # FastAPI App
@@ -69,68 +61,11 @@ def root():
 @app.post("/answer")
 def answer(req: QuestionRequest):
 
+    # -----------------------------
     # Empty input handling
+    # -----------------------------
 
-    if len(req.chunks) == 0 or req.question.strip() == "":
-        return {
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.0,
-            "answerable": False
-        }
-
-    # -------------------------
-    # Embed question and chunks
-    # -------------------------
-
-    question_embedding = embed_model.encode(
-        req.question,
-        convert_to_tensor=True
-    )
-
-    chunk_texts = [c.text for c in req.chunks]
-
-    chunk_embeddings = embed_model.encode(
-        chunk_texts,
-        convert_to_tensor=True
-    )
-
-    similarities = cos_sim(question_embedding, chunk_embeddings)[0].cpu().numpy()
-
-    best_index = int(np.argmax(similarities))
-    best_score = float(similarities[best_index])
-
-    
-    # -------------------------
-    # Unanswerable check
-    # -------------------------
-
-    if best_score < 0.35:
-        return {
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": round(min(best_score, 0.30), 2),
-            "answerable": False
-        }
-
-    # -------------------------
-    # Select Top Chunks
-    # -------------------------
-
-    top_indices = similarities.argsort()[-2:][::-1]
-
-    citations = []
-    context = ""
-
-    for idx, score in zip(top_indices, similarities[top_indices]):
-
-        if score > 0.30:
-            context += req.chunks[idx].text + "\n\n"
-            citations.append(req.chunks[idx].chunk_id)
-
-    # If nothing passed similarity threshold
-
-    if len(citations) == 0:
+    if not req.question.strip() or len(req.chunks) == 0:
         return {
             "answer": "I don't know",
             "citations": [],
@@ -138,62 +73,115 @@ def answer(req: QuestionRequest):
             "answerable": False
         }
 
-    # -------------------------
+    # -----------------------------
+    # Build Context
+    # -----------------------------
+
+    context = ""
+
+    for chunk in req.chunks:
+        context += f"{chunk.chunk_id}: {chunk.text}\n\n"
+
+    # -----------------------------
     # Prompt
-    # -------------------------
+    # -----------------------------
 
     prompt = f"""
-You are a retrieval-augmented question answering assistant.
+You are a grounded question answering assistant.
 
-Answer ONLY using the information in the provided context.
+Answer ONLY using the provided context.
 
-If the answer is not directly supported by the context,
-reply exactly:
+If the answer cannot be fully supported by the context, return exactly this JSON:
 
-I don't know
+{{
+  "answer": "I don't know",
+  "citations": [],
+  "answerable": false
+}}
 
-Do not use outside knowledge.
-Do not guess.
-Do not explain.
+If the answer CAN be supported, return ONLY valid JSON like:
+
+{{
+  "answer": "...",
+  "citations": ["C1","C2"],
+  "answerable": true
+}}
+
+Rules:
+
+- Never use outside knowledge.
+- Never guess.
+- Cite ONLY chunk IDs that are provided.
+- Do NOT invent chunk IDs.
+- Return ONLY JSON.
+- No markdown.
+- No explanation.
 
 Context:
+
 {context}
 
 Question:
-{req.question}
 
-Answer:
+{req.question}
 """
 
-    # -------------------------
+    # -----------------------------
     # Ask Groq
-    # -------------------------
+    # -----------------------------
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0
-    )
+    try:
 
-    answer = response.choices[0].message.content.strip()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0
+        )
 
-    print("LLM Answer:", answer)
+        output = response.choices[0].message.content.strip()
 
-    # -------------------------
-    # Final Check
-    # -------------------------
+        # Remove markdown if present
+        output = output.replace("```json", "").replace("```", "").strip()
 
-    lower_answer = answer.lower()
+        result = json.loads(output)
+
+    except Exception:
+
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.20,
+            "answerable": False
+        }
+
+    # -----------------------------
+    # Validate citations
+    # -----------------------------
+
+    valid_ids = {chunk.chunk_id for chunk in req.chunks}
+
+    citations = [
+        cid
+        for cid in result.get("citations", [])
+        if cid in valid_ids
+    ]
+
+    answer_text = result.get("answer", "I don't know")
+    answerable = result.get("answerable", False)
+
+    # -----------------------------
+    # Final Guardrail
+    # -----------------------------
 
     if (
-        "don't know" in lower_answer
-        or "dont know" in lower_answer
-        or lower_answer == "unknown"
+        not answerable
+        or answer_text.lower() == "i don't know"
+        or len(citations) == 0
     ):
         return {
             "answer": "I don't know",
@@ -203,8 +191,8 @@ Answer:
         }
 
     return {
-        "answer": answer,
+        "answer": answer_text,
         "citations": citations,
-        "confidence": round(min(best_score, 0.99), 2),
+        "confidence": 0.95,
         "answerable": True
     }
